@@ -1,0 +1,571 @@
+xq
+
+NOTE: Every section of code was developed by Annika Sachdeva, except for
+the weighted normaliation (class WNc) which was created by the lab of
+Odelia Schwartz
+
+NECESSARY IMPORTS FOR MODEL + DATA
+
+(BY ANNIKA SACHDEVA)
+
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+    !pip install -qq medmnist
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0.0/88.3 kB ? eta -:--:--
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 88.3/88.3 kB 2.9 MB/s eta 0:00:00
+    etadata (setup.py) ... 
+
+    import numpy as np
+    import sys
+    import os
+
+Weighted normalization code: DEVELOPED BY MY PROFESSOR/LAB
+
+    # Weighted Nomalization - center only pool
+    class WNc(tf.keras.layers.Layer):
+
+        def get_config(self):
+            config = {
+                'surround_dist': self.surround_dist,
+                'beta_min': self._beta_min,
+                'beta_init': self._beta_init,
+                'gamma_init': self._gamma_init,
+                'data_format': self.data_format,
+            }
+            base_config = super(WNc, self).get_config()
+            return dict(list(base_config.items()) + list(config.items()))
+
+        def __init__(self,
+                   surround_dist=1,
+                   beta_min=1e-6,
+                   beta_init = 1e-6,
+                   gamma_init=1/8,
+                   data_format='channels_last',
+                   name=None,
+                   trainable=True,
+                   **kwargs):
+            super(WNc, self).__init__(
+                trainable=trainable,
+                name=name)#,
+                #**kwargs)
+            self.surround_dist = surround_dist
+            self._beta_min = beta_min
+            self._beta_init = beta_init
+            self._gamma_init = gamma_init
+            self.data_format = data_format
+            self._channel_axis()  # trigger ValueError early
+
+        def _channel_axis(self):
+            try:
+                return {'channels_first': 1, 'channels_last': -1}[self.data_format]
+            except KeyError:
+                raise ValueError('Unsupported `data_format` for WN layer: {}.'.format(
+                self.data_format))
+
+        def build(self, input_shape):
+            channel_axis = self._channel_axis()
+            self.norm_groups = int(input_shape[channel_axis]/8)
+            super(WNc, self).build(input_shape)
+            num_channels = input_shape[channel_axis]
+            if num_channels is None:
+                raise ValueError('The channel dimension of the inputs to `WN` '
+                               'must be defined.')
+
+            if input_shape[channel_axis] % self.norm_groups != 0:
+                raise ValueError('The number of channels must be a multiple of '
+                               'the normalization_groups.')
+
+            self._input_rank = input_shape.ndims
+
+            def beta_outside_initializer(shape, dtype=None, partition_info=None):
+                del partition_info  # unused
+                return tf.zeros(shape, dtype='float32')
+
+            def gamma_outside_initializer(shape, dtype=None, partition_info=None):
+                del partition_info  # unused
+                return tf.ones(shape, dtype='float32')
+
+            def beta_initializer(shape, dtype=None, partition_info=None):
+                del partition_info  # unused
+                return self._beta_init * tf.ones(shape, dtype='float32')
+
+            def gamma_k_initializer(shape, dtype=None, partition_info=None):
+                del partition_info  # unused
+                one_tensor = tf.ones(shape, dtype='float32')
+                return self._gamma_init * one_tensor
+
+            gamma_k_shape = [1,] * 2  +  [num_channels//self.norm_groups, num_channels]
+            beta_shape = [num_channels]
+            beta_outside_shape = [num_channels]
+            gamma_outside_shape = [num_channels]
+
+            self.beta = self.add_weight(
+                name='beta',
+                shape=beta_shape,
+                initializer=beta_initializer,
+                dtype=self.dtype,
+                constraint=keras.constraints.NonNeg(),
+                trainable=True)
+
+            self.gamma_k = self.add_weight(
+                name='gamma_k',
+                shape=gamma_k_shape,
+                initializer=gamma_k_initializer,
+                dtype=self.dtype,
+                constraint=keras.constraints.NonNeg(),
+                trainable=True)
+
+            self.beta_outside = self.add_weight(
+                name='beta_outside',
+                shape=beta_outside_shape,
+                initializer=beta_outside_initializer,
+                dtype=self.dtype,
+                trainable=True)
+
+            self.gamma_outside = self.add_weight(
+                name='gamma_outside',
+                shape=gamma_outside_shape,
+                initializer=gamma_outside_initializer,
+                dtype=self.dtype,
+                constraint=keras.constraints.NonNeg(),
+                trainable=True)
+
+
+            self.built = True
+
+        def call(self, inputs):
+            inputs = tf.convert_to_tensor(inputs, dtype=self.dtype)
+            ndim = self._input_rank
+            shape = self.gamma_k.get_shape().as_list()
+            dilation_rate = [self.surround_dist]*(ndim-2)
+            squared_inputs = tf.math.square(inputs)
+            squared_input_groups =  tf.split(squared_inputs, self.norm_groups, -1)
+            gamma_k_groups = tf.split(self.gamma_k, self.norm_groups, -1)
+
+            # Compute normalization pool.
+
+            # Pk for center group
+            convolve_k = lambda inputs_i, gamma_k: tf.nn.convolution(inputs_i,
+                                                                      gamma_k,
+                                                                      strides=(1, 1),
+                                                                      padding='SAME')
+
+            Pk_groups= [convolve_k(i, k) for i,k in zip(squared_input_groups, gamma_k_groups)]
+            Pk = tf.concat(Pk_groups, axis=3)
+            beta = self.beta + self._beta_min
+            norm_pool_k = tf.nn.bias_add(Pk, beta, data_format='N'+'DHW' [-(ndim - 2):]+'C') # NHWC
+            norm_pool_k = tf.math.sqrt(norm_pool_k)
+            norm_pool = tf.math.reciprocal(norm_pool_k)
+            outputs = tf.multiply(inputs, norm_pool)
+            outputs = outputs * self.gamma_outside + self.beta_outside
+            outputs.set_shape(inputs.get_shape())
+
+            return outputs
+
+        def compute_output_shape(self, input_shape):
+            channel_axis = self._channel_axis()
+            input_shape = tensor_shape.TensorShape(input_shape)
+            #if not 3 <= input_shape.ndim <= 5:
+            #  raise ValueError('`input_shape` must be of rank 3 to 5, inclusive.')
+            if input_shape[channel_axis].value is None:
+                raise ValueError(
+                  'The channel dimension of `input_shape` must be defined.')
+            return input_shape
+
+CREATION OF RESIDUAL BLOCK + RESNET18, ALONG WITH INITIAL CONVOLUTION
+
+(BY ANNIKA SACHDEVA)
+
+    def residual_block(x,filters,kernel_size = 3, stride = 1, conv_shortcut = True):
+        if conv_shortcut:
+            shortcut = layers.Conv2D(filters,1,strides=stride)(x)
+        else:
+            shortcut = x
+
+
+        x = layers.Conv2D(filters,kernel_size,strides=stride,padding='same')(x)
+        x = WNc()(x)
+        x = layers.Activation('relu')(x)
+
+        x = layers.Conv2D(filters,kernel_size,padding='same')(x)
+        x = WNc()(x)
+
+        x = layers.Add()([shortcut,x])
+        return layers.Activation('relu')(x)
+
+    def ResNet18(input_shape,num_classes):
+        inputs = keras.Input(shape = input_shape)
+
+        #initial convolution
+        x = layers.Conv2D(64,7,strides=2,padding='same')(inputs)
+        x = WNc()(x)
+        x = layers.Activation('relu')(x)
+        x = layers.MaxPooling2D(3,strides=2,padding='same')(x)
+
+
+        #residual blocks
+        x = residual_block(x, 64, stride=1, conv_shortcut=True)
+        x = residual_block(x, 64, conv_shortcut=False)
+
+        x = residual_block(x, 128, stride=2, conv_shortcut=True)
+        x = residual_block(x, 128, conv_shortcut=False)
+
+        x = residual_block(x, 256, stride=2, conv_shortcut=True)
+        x = residual_block(x, 256, conv_shortcut=False)
+
+        x = residual_block(x, 512, stride=2, conv_shortcut=True)
+        x = residual_block(x, 512, conv_shortcut=False)
+
+        #fully connected
+        x = layers.GlobalAveragePooling2D()(x)
+        outputs = layers.Dense(num_classes, activation = 'softmax')(x)
+        return keras.Model(inputs,outputs)
+
+DATASET PREPARATION
+
+(BY ANNIKA SACHDEVA)
+
+    import medmnist
+    from medmnist import PathMNIST
+    import numpy as np
+
+    print(medmnist.__version__)
+    print(dir(medmnist))
+
+    2.2.3
+    ['AdrenalMNIST3D', 'BloodMNIST', 'BreastMNIST', 'ChestMNIST', 'DermaMNIST', 'Evaluator', 'FractureMNIST3D', 'HOMEPAGE', 'INFO', 'NoduleMNIST3D', 'OCTMNIST', 'OrganAMNIST', 'OrganCMNIST', 'OrganMNIST3D', 'OrganSMNIST', 'PathMNIST', 'PneumoniaMNIST', 'RetinaMNIST', 'SynapseMNIST3D', 'TissueMNIST', 'VesselMNIST3D', '__builtins__', '__cached__', '__doc__', '__file__', '__loader__', '__name__', '__package__', '__path__', '__spec__', '__version__', 'dataset', 'evaluator', 'info']
+
+
+
+    data_dir = './medmnist_data'
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+
+
+    train_data = PathMNIST(root=data_dir, download=True, split='train')
+    val_data = PathMNIST(root=data_dir, download=True, split='val')
+    test_data = PathMNIST(root=data_dir, download=True, split='test')
+
+    _, train_labels = zip(*train_data)  # Unzipping the images and labels
+    unique_labels = np.unique(train_labels)
+    num_classes = len(unique_labels)
+
+    Downloading https://zenodo.org/records/6496656/files/pathmnist.npz to ./medmnist_data/pathmnist.npz
+
+    100%|██████████| 205615438/205615438 [00:08<00:00, 24043704.37it/s]
+
+    Using downloaded and verified file: ./medmnist_data/pathmnist.npz
+    Using downloaded and verified file: ./medmnist_data/pathmnist.npz
+
+    print(type(train_data))
+    if hasattr(train_data, "__len__"):
+        print(len(train_data))
+    if isinstance(train_data, tuple) or isinstance(train_data, list):
+        for item in train_data:
+            print(type(item), item.shape if isinstance(item, np.ndarray) else "")
+
+    <class 'medmnist.dataset.PathMNIST'>
+    89996
+
+    from PIL import Image
+
+    def convert_to_tf_dataset(data, batch_size=32):
+        images, labels = [], []
+        for img, label in data:
+            # Convert each PIL Image to a numpy array
+            img_array = np.array(img)
+            images.append(img_array)
+            labels.append(label)
+
+        # Convert lists to numpy arrays
+        images = np.array(images)
+        labels = np.array(labels)
+
+        # Create TensorFlow datasets
+        dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+        dataset = dataset.shuffle(buffer_size=1024).batch(batch_size).prefetch(tf.data.experimental.AUTOTUNE)
+
+        return dataset
+
+    train_dataset = convert_to_tf_dataset(train_data)
+    val_dataset = convert_to_tf_dataset(val_data)
+    test_dataset = convert_to_tf_dataset(test_data)
+
+    model = ResNet18((28,28,3), num_classes = num_classes)
+    model.summary()
+
+    Model: "model"
+    __________________________________________________________________________________________________
+     Layer (type)                Output Shape                 Param #   Connected to                  
+    ==================================================================================================
+     input_1 (InputLayer)        [(None, 28, 28, 3)]          0         []                            
+                                                                                                      
+     conv2d (Conv2D)             (None, 14, 14, 64)           9472      ['input_1[0][0]']             
+                                                                                                      
+     w_nc (WNc)                  (None, 14, 14, 64)           704       ['conv2d[0][0]']              
+                                                                                                      
+     activation (Activation)     (None, 14, 14, 64)           0         ['w_nc[0][0]']                
+                                                                                                      
+     max_pooling2d (MaxPooling2  (None, 7, 7, 64)             0         ['activation[0][0]']          
+     D)                                                                                               
+                                                                                                      
+     conv2d_2 (Conv2D)           (None, 7, 7, 64)             36928     ['max_pooling2d[0][0]']       
+                                                                                                      
+     w_nc_1 (WNc)                (None, 7, 7, 64)             704       ['conv2d_2[0][0]']            
+                                                                                                      
+     activation_1 (Activation)   (None, 7, 7, 64)             0         ['w_nc_1[0][0]']              
+                                                                                                      
+     conv2d_3 (Conv2D)           (None, 7, 7, 64)             36928     ['activation_1[0][0]']        
+                                                                                                      
+     conv2d_1 (Conv2D)           (None, 7, 7, 64)             4160      ['max_pooling2d[0][0]']       
+                                                                                                      
+     w_nc_2 (WNc)                (None, 7, 7, 64)             704       ['conv2d_3[0][0]']            
+                                                                                                      
+     add (Add)                   (None, 7, 7, 64)             0         ['conv2d_1[0][0]',            
+                                                                         'w_nc_2[0][0]']              
+                                                                                                      
+     activation_2 (Activation)   (None, 7, 7, 64)             0         ['add[0][0]']                 
+                                                                                                      
+     conv2d_4 (Conv2D)           (None, 7, 7, 64)             36928     ['activation_2[0][0]']        
+                                                                                                      
+     w_nc_3 (WNc)                (None, 7, 7, 64)             704       ['conv2d_4[0][0]']            
+                                                                                                      
+     activation_3 (Activation)   (None, 7, 7, 64)             0         ['w_nc_3[0][0]']              
+                                                                                                      
+     conv2d_5 (Conv2D)           (None, 7, 7, 64)             36928     ['activation_3[0][0]']        
+                                                                                                      
+     w_nc_4 (WNc)                (None, 7, 7, 64)             704       ['conv2d_5[0][0]']            
+                                                                                                      
+     add_1 (Add)                 (None, 7, 7, 64)             0         ['activation_2[0][0]',        
+                                                                         'w_nc_4[0][0]']              
+                                                                                                      
+     activation_4 (Activation)   (None, 7, 7, 64)             0         ['add_1[0][0]']               
+                                                                                                      
+     conv2d_7 (Conv2D)           (None, 4, 4, 128)            73856     ['activation_4[0][0]']        
+                                                                                                      
+     w_nc_5 (WNc)                (None, 4, 4, 128)            1408      ['conv2d_7[0][0]']            
+                                                                                                      
+     activation_5 (Activation)   (None, 4, 4, 128)            0         ['w_nc_5[0][0]']              
+                                                                                                      
+     conv2d_8 (Conv2D)           (None, 4, 4, 128)            147584    ['activation_5[0][0]']        
+                                                                                                      
+     conv2d_6 (Conv2D)           (None, 4, 4, 128)            8320      ['activation_4[0][0]']        
+                                                                                                      
+     w_nc_6 (WNc)                (None, 4, 4, 128)            1408      ['conv2d_8[0][0]']            
+                                                                                                      
+     add_2 (Add)                 (None, 4, 4, 128)            0         ['conv2d_6[0][0]',            
+                                                                         'w_nc_6[0][0]']              
+                                                                                                      
+     activation_6 (Activation)   (None, 4, 4, 128)            0         ['add_2[0][0]']               
+                                                                                                      
+     conv2d_9 (Conv2D)           (None, 4, 4, 128)            147584    ['activation_6[0][0]']        
+                                                                                                      
+     w_nc_7 (WNc)                (None, 4, 4, 128)            1408      ['conv2d_9[0][0]']            
+                                                                                                      
+     activation_7 (Activation)   (None, 4, 4, 128)            0         ['w_nc_7[0][0]']              
+                                                                                                      
+     conv2d_10 (Conv2D)          (None, 4, 4, 128)            147584    ['activation_7[0][0]']        
+                                                                                                      
+     w_nc_8 (WNc)                (None, 4, 4, 128)            1408      ['conv2d_10[0][0]']           
+                                                                                                      
+     add_3 (Add)                 (None, 4, 4, 128)            0         ['activation_6[0][0]',        
+                                                                         'w_nc_8[0][0]']              
+                                                                                                      
+     activation_8 (Activation)   (None, 4, 4, 128)            0         ['add_3[0][0]']               
+                                                                                                      
+     conv2d_12 (Conv2D)          (None, 2, 2, 256)            295168    ['activation_8[0][0]']        
+                                                                                                      
+     w_nc_9 (WNc)                (None, 2, 2, 256)            2816      ['conv2d_12[0][0]']           
+                                                                                                      
+     activation_9 (Activation)   (None, 2, 2, 256)            0         ['w_nc_9[0][0]']              
+                                                                                                      
+     conv2d_13 (Conv2D)          (None, 2, 2, 256)            590080    ['activation_9[0][0]']        
+                                                                                                      
+     conv2d_11 (Conv2D)          (None, 2, 2, 256)            33024     ['activation_8[0][0]']        
+                                                                                                      
+     w_nc_10 (WNc)               (None, 2, 2, 256)            2816      ['conv2d_13[0][0]']           
+                                                                                                      
+     add_4 (Add)                 (None, 2, 2, 256)            0         ['conv2d_11[0][0]',           
+                                                                         'w_nc_10[0][0]']             
+                                                                                                      
+     activation_10 (Activation)  (None, 2, 2, 256)            0         ['add_4[0][0]']               
+                                                                                                      
+     conv2d_14 (Conv2D)          (None, 2, 2, 256)            590080    ['activation_10[0][0]']       
+                                                                                                      
+     w_nc_11 (WNc)               (None, 2, 2, 256)            2816      ['conv2d_14[0][0]']           
+                                                                                                      
+     activation_11 (Activation)  (None, 2, 2, 256)            0         ['w_nc_11[0][0]']             
+                                                                                                      
+     conv2d_15 (Conv2D)          (None, 2, 2, 256)            590080    ['activation_11[0][0]']       
+                                                                                                      
+     w_nc_12 (WNc)               (None, 2, 2, 256)            2816      ['conv2d_15[0][0]']           
+                                                                                                      
+     add_5 (Add)                 (None, 2, 2, 256)            0         ['activation_10[0][0]',       
+                                                                         'w_nc_12[0][0]']             
+                                                                                                      
+     activation_12 (Activation)  (None, 2, 2, 256)            0         ['add_5[0][0]']               
+                                                                                                      
+     conv2d_17 (Conv2D)          (None, 1, 1, 512)            1180160   ['activation_12[0][0]']       
+                                                                                                      
+     w_nc_13 (WNc)               (None, 1, 1, 512)            5632      ['conv2d_17[0][0]']           
+                                                                                                      
+     activation_13 (Activation)  (None, 1, 1, 512)            0         ['w_nc_13[0][0]']             
+                                                                                                      
+     conv2d_18 (Conv2D)          (None, 1, 1, 512)            2359808   ['activation_13[0][0]']       
+                                                                                                      
+     conv2d_16 (Conv2D)          (None, 1, 1, 512)            131584    ['activation_12[0][0]']       
+                                                                                                      
+     w_nc_14 (WNc)               (None, 1, 1, 512)            5632      ['conv2d_18[0][0]']           
+                                                                                                      
+     add_6 (Add)                 (None, 1, 1, 512)            0         ['conv2d_16[0][0]',           
+                                                                         'w_nc_14[0][0]']             
+                                                                                                      
+     activation_14 (Activation)  (None, 1, 1, 512)            0         ['add_6[0][0]']               
+                                                                                                      
+     conv2d_19 (Conv2D)          (None, 1, 1, 512)            2359808   ['activation_14[0][0]']       
+                                                                                                      
+     w_nc_15 (WNc)               (None, 1, 1, 512)            5632      ['conv2d_19[0][0]']           
+                                                                                                      
+     activation_15 (Activation)  (None, 1, 1, 512)            0         ['w_nc_15[0][0]']             
+                                                                                                      
+     conv2d_20 (Conv2D)          (None, 1, 1, 512)            2359808   ['activation_15[0][0]']       
+                                                                                                      
+     w_nc_16 (WNc)               (None, 1, 1, 512)            5632      ['conv2d_20[0][0]']           
+                                                                                                      
+     add_7 (Add)                 (None, 1, 1, 512)            0         ['activation_14[0][0]',       
+                                                                         'w_nc_16[0][0]']             
+                                                                                                      
+     activation_16 (Activation)  (None, 1, 1, 512)            0         ['add_7[0][0]']               
+                                                                                                      
+     global_average_pooling2d (  (None, 512)                  0         ['activation_16[0][0]']       
+     GlobalAveragePooling2D)                                                                          
+                                                                                                      
+     dense (Dense)               (None, 9)                    4617      ['global_average_pooling2d[0][
+                                                                        0]']                          
+                                                                                                      
+    ==================================================================================================
+    Total params: 11223433 (42.81 MB)
+    Trainable params: 11223433 (42.81 MB)
+    Non-trainable params: 0 (0.00 Byte)
+    __________________________________________________________________________________________________
+
+MODEL DEFINITION, COMPLIATION + TRAINING
+
+(BY ANNIKA SACHDEVA)
+
+
+    model.compile(optimizer = 'adam', loss = 'sparse_categorical_crossentropy', metrics = ['accuracy'])
+    history = model.fit(train_dataset, epochs=20, validation_data=val_dataset)
+
+    Epoch 1/20
+    2813/2813 [==============================] - 305s 94ms/step - loss: 1.7438 - accuracy: 0.3296 - val_loss: 1.4095 - val_accuracy: 0.4502
+    Epoch 2/20
+    2813/2813 [==============================] - 263s 93ms/step - loss: 1.1388 - accuracy: 0.5715 - val_loss: 0.9804 - val_accuracy: 0.6354
+    Epoch 3/20
+    2813/2813 [==============================] - 261s 93ms/step - loss: 0.9147 - accuracy: 0.6602 - val_loss: 0.8842 - val_accuracy: 0.6699
+    Epoch 4/20
+    2813/2813 [==============================] - 260s 92ms/step - loss: 0.8206 - accuracy: 0.6925 - val_loss: 0.7797 - val_accuracy: 0.7071
+    Epoch 5/20
+    2813/2813 [==============================] - 260s 92ms/step - loss: 0.7341 - accuracy: 0.7240 - val_loss: 0.7373 - val_accuracy: 0.7282
+    Epoch 6/20
+    2813/2813 [==============================] - 262s 93ms/step - loss: 0.6640 - accuracy: 0.7496 - val_loss: 0.6523 - val_accuracy: 0.7557
+    Epoch 7/20
+    2813/2813 [==============================] - 261s 93ms/step - loss: 0.7577 - accuracy: 0.7166 - val_loss: 0.7065 - val_accuracy: 0.7345
+    Epoch 8/20
+    2813/2813 [==============================] - 261s 93ms/step - loss: 0.6063 - accuracy: 0.7725 - val_loss: 0.6266 - val_accuracy: 0.7681
+    Epoch 9/20
+    2813/2813 [==============================] - 264s 94ms/step - loss: 0.7097 - accuracy: 0.7360 - val_loss: 0.8911 - val_accuracy: 0.6699
+    Epoch 10/20
+    2813/2813 [==============================] - 255s 91ms/step - loss: 0.7218 - accuracy: 0.7327 - val_loss: 0.5971 - val_accuracy: 0.7835
+    Epoch 11/20
+    2813/2813 [==============================] - 253s 90ms/step - loss: 0.5106 - accuracy: 0.8099 - val_loss: 0.6238 - val_accuracy: 0.7770
+    Epoch 12/20
+    2813/2813 [==============================] - 255s 91ms/step - loss: 0.4468 - accuracy: 0.8323 - val_loss: 0.5710 - val_accuracy: 0.7905
+    Epoch 13/20
+    2813/2813 [==============================] - 253s 90ms/step - loss: 0.9094 - accuracy: 0.6620 - val_loss: 0.8255 - val_accuracy: 0.6946
+    Epoch 14/20
+    2813/2813 [==============================] - 253s 90ms/step - loss: 0.7481 - accuracy: 0.7209 - val_loss: 0.6775 - val_accuracy: 0.7529
+    Epoch 15/20
+    2813/2813 [==============================] - 250s 89ms/step - loss: 0.6595 - accuracy: 0.7584 - val_loss: 0.6905 - val_accuracy: 0.7514
+    Epoch 16/20
+    2813/2813 [==============================] - 253s 90ms/step - loss: 0.6746 - accuracy: 0.7554 - val_loss: 0.9576 - val_accuracy: 0.6458
+    Epoch 17/20
+    2813/2813 [==============================] - 255s 91ms/step - loss: 0.7118 - accuracy: 0.7342 - val_loss: 0.6700 - val_accuracy: 0.7508
+    Epoch 18/20
+    2813/2813 [==============================] - 259s 92ms/step - loss: 0.8220 - accuracy: 0.7179 - val_loss: 0.8787 - val_accuracy: 0.6700
+    Epoch 19/20
+    2813/2813 [==============================] - 253s 90ms/step - loss: 0.8091 - accuracy: 0.6969 - val_loss: 0.7372 - val_accuracy: 0.7253
+    Epoch 20/20
+    2813/2813 [==============================] - 254s 90ms/step - loss: 0.6960 - accuracy: 0.7383 - val_loss: 0.7800 - val_accuracy: 0.7178
+
+METRIC EVALUATION
+
+(BY ANNIKA SACHDEVA)
+
+    test_loss, test_accuracy = model.evaluate(test_dataset)
+    print("Test accuracy:", test_accuracy)
+
+    225/225 [==============================] - 6s 25ms/step - loss: 1.0180 - accuracy: 0.6536
+    Test accuracy: 0.6536211967468262
+
+    import matplotlib.pyplot as plt
+
+    # Extracting values from the history object
+    train_loss = history.history['loss']
+    val_loss = history.history['val_loss']
+    train_acc = history.history['accuracy']
+    val_acc = history.history['val_accuracy']
+
+    # Plotting Loss
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_loss, label='Training Loss')
+    plt.plot(val_loss, label='Validation Loss')
+    plt.legend()
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Loss vs. Epochs')
+
+    # Plotting Accuracy
+    plt.subplot(1, 2, 2)
+    plt.plot(train_acc, label='Training Accuracy')
+    plt.plot(val_acc, label='Validation Accuracy')
+    plt.legend()
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.title('Accuracy vs. Epochs')
+
+    plt.tight_layout()
+    plt.show()
+
+[]
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Assuming binary classification
+    TP = confusion[1, 1]
+    TN = confusion[0, 0]
+    FP = confusion[0, 1]
+    FN = confusion[1, 0]
+
+    # Plotting
+    labels = ['True Positive', 'True Negative', 'False Positive', 'False Negative']
+    values = [TP, TN, FP, FN]
+
+    plt.figure(figsize=(10, 6))
+    bars = sns.barplot(x=labels, y=values, palette="viridis")
+    plt.title('Classification Metrics')
+    plt.ylabel('Count')  # Y-axis label
+
+    # Adding data labels on top of the bars
+    for bar in bars.patches:
+        bars.annotate(format(bar.get_height(), '.0f'),
+                      (bar.get_x() + bar.get_width() / 2,
+                       bar.get_height()), ha='center', va='center',
+                      size=10, xytext=(0, 8),
+                      textcoords='offset points')
+
+    plt.show()
